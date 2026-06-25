@@ -17,6 +17,29 @@ mcp = FastMCP("Model Scoreboard", instructions="Track-record hive: rank models/a
 
 MODEL_TYPES = ["LLM", "MoE", "MoM", "SLM", "world", "reasoning", "multimodal"]
 
+# ── SIGIL bus: every hop emits a hash-chained signed line to the shared chain ──
+# Unify all layers by pointing them at the same SIGIL_LOG (the "connect all" move).
+import hashlib as _hl, time as _t, json as _j, os as _os
+_SIGIL_LOG = _os.environ.get("SIGIL_LOG", _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "scoreboard_sigil.log"))
+
+def _sigil(op: str, body: str) -> str:
+    """Emit one hash-chained SIGIL line (op|ts|prev|body → sha256 digest). The vibration, recorded."""
+    try:
+        prev = ""
+        if _os.path.exists(_SIGIL_LOG):
+            with open(_SIGIL_LOG) as f:
+                lines = f.readlines()
+                if lines:
+                    prev = _j.loads(lines[-1]).get("digest", "")
+        ts = int(_t.time())
+        digest = _hl.sha256(f"{op}|{ts}|{prev[:8]}|{body}".encode()).hexdigest()[:16]
+        _os.makedirs(_os.path.dirname(_SIGIL_LOG), exist_ok=True)
+        with open(_SIGIL_LOG, "a") as f:
+            f.write(_j.dumps({"ts": ts, "op": op, "body": body, "prev_digest": prev, "digest": digest}) + "\n")
+        return digest
+    except Exception:
+        return ""
+
 # Seed registry — the current landscape (illustrative scores until live data arrives).
 _MODELS: Dict[str, Dict[str, Any]] = {}
 _RESULTS: List[Dict[str, Any]] = []  # {model, task, score(0-1)}
@@ -75,7 +98,8 @@ def record_result(model: str, task: str, score: float, provider: str = "", type:
         register_model(model, provider or "unknown", type)
     s = max(0.0, min(1.0, float(score)))
     _RESULTS.append({"model": model, "task": task, "score": s})
-    return {"recorded": True, "model": model, "task": task, "score": s, "total_results": len(_RESULTS)}
+    sig = _sigil("R", f"score|{model}|{task}|{s}")
+    return {"recorded": True, "model": model, "task": task, "score": s, "total_results": len(_RESULTS), "sigil": sig}
 
 
 def _rank(task: Optional[str]) -> List[Ranked]:
@@ -130,8 +154,9 @@ def bft_vote(task: str, candidates: List[Dict[str, Any]]) -> Verdict:
     winner = max(votes, key=votes.get) if votes else None
     total = sum(votes.values()) or 1
     majority = votes.get(winner, 0) > total / 2
+    sig = _sigil("V", f"vote|{task}|winner={winner}|{'consensus' if majority else 'plurality'}")
     return Verdict(winner=winner, method="score-weighted BFT", votes=votes,
-                   note=("consensus (>half)" if majority else "plurality — no Byzantine majority; escalate to council"))
+                   note=("consensus (>half)" if majority else "plurality — no Byzantine majority; escalate to council") + (f" · sigil {sig}" if sig else ""))
 
 
 @mcp.tool()
